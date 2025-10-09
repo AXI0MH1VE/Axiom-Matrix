@@ -1,6 +1,12 @@
 use blake3::Hasher;
 use tokio::task;
 
+pub fn generate_hash(data: &str) -> blake3::Hash {
+    let mut hasher = Hasher::new();
+    hasher.update(data.as_bytes());
+    hasher.finalize()
+}
+
 pub async fn check_integrity(data: &[u8], original: &str) -> bool {
     let mut hasher = Hasher::new();
     hasher.update(original.as_bytes());

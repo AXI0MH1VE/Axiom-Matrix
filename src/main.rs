@@ -1,9 +1,12 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use std::path::Path;
+use std::fs::File;
+use std::io::copy;
 use agent_matrix::agents::{orchestrate, EthicalAgent, ComputeAgent};
-use agent_matrix::encryption::{encrypt_command, decrypt_command};
-use agent_matrix::integrity::check_integrity;
+use agent_matrix::encryption::{encrypt_command_with_integrity, decrypt_command_with_integrity};
+use agent_matrix::integrity::{check_integrity, generate_hash};
 use agent_matrix::ethics::EthicalGuard;
 use agent_matrix::gpu::init_vulkan;
 use agent_matrix::orchestration::execute_command;
@@ -15,6 +18,36 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Tab, List, ListState};
 use clap::Parser;
 
+// Hardcoded trusted source and integrity hash for the model
+const MODEL_URL: &str = "https://huggingface.co/distilbert-base-uncased/resolve/main/model.safetensors?download=true";
+const MODEL_CHECKSUM: &str = "EXPECTED_BLAKE3_HASH_OF_MODEL_FILE"; // Replace with the actual hash
+
+async fn bootstrap_environment() -> Result<(), String> {
+    let model_path = Path::new("model.safetensors");
+    if !model_path.exists() {
+        println!("Model not found. Downloading from trusted source...");
+        let response = reqwest::get(MODEL_URL).await.map_err(|e| e.to_string())?;
+        let mut dest = File::create(&model_path).map_err(|e| e.to_string())?;
+        let content = response.bytes().await.map_err(|e| e.to_string())?;
+        copy(&mut content.as_ref(), &mut dest).map_err(|e| e.to_string())?;
+        println!("Download complete. Verifying integrity...");
+    }
+
+    // Verify checksum regardless of whether it was just downloaded
+    let model_bytes = std::fs::read(&model_path).map_err(|e| e.to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&model_bytes);
+    let actual_hash = hasher.finalize().to_hex().to_string();
+
+    if actual_hash != MODEL_CHECKSUM {
+        // In a real app, you would delete the corrupted file and error out
+        return Err(format!("Model integrity check failed! Expected {}, got {}.", MODEL_CHECKSUM, actual_hash));
+    }
+
+    println!("Environment bootstrap successful. Model verified.");
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "agent-matrix")]
 struct Args {
@@ -24,6 +57,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Run the bootstrapper at the very beginning
+    if let Err(e) = bootstrap_environment().await {
+        eprintln!("FATAL: Failed to initialize sovereign environment: {}", e);
+        return Ok(()); // Exit gracefully
+    }
+
     let args = Args::parse();
     let _theme = args.theme;
 
@@ -32,10 +71,18 @@ async fn main() -> io::Result<()> {
     });
     let ethical_agent = Arc::new(EthicalAgent::new(guard.clone()));
 
-    let vulkan_instance = init_vulkan().ok();
-    let compute_agent = ComputeAgent::new(vulkan_instance.clone());
+    let (compute_agent, vulkan_instance): (Arc<dyn agents::Agent>, Option<Arc<vulkano::instance::Instance>>) = match init_vulkan() {
+        Ok(instance_arc) => {
+            let instance_clone = instance_arc.clone();
+            (Arc::new(ComputeAgent::new(Some(instance_arc))), Some(instance_clone))
+        },
+        Err(e) => {
+            println!("WARNING: Vulkan initialization failed: {}. Falling back to CPU.", e);
+            (Arc::new(ComputeAgent::new(None)), None)
+        }
+    };
 
-    let agents: Vec<Arc<dyn agent_matrix::agents::Agent>> = vec![ethical_agent, Arc::new(compute_agent)];
+    let agents: Vec<Arc<dyn agents::Agent>> = vec![ethical_agent, compute_agent];
 
     let ux = Arc::new(UXEngine::new());
     let mut history = vec!["ls".to_string(), "git status".to_string()];
@@ -89,25 +136,25 @@ async fn main() -> io::Result<()> {
             match key.code {
                 KeyCode::Enter if key.kind == KeyEventKind::Press => {
                     if !input.is_empty() {
-                        let encrypted = encrypt_command(&input).await;
-                        let decrypted = decrypt_command(&encrypted).await.expect("Decryption failed");
-                        // Zero-trust: Hash decrypted for integrity (self-hash proof for zero-trust comparison)
-                        let mut hasher = Hasher::new();
-                        hasher.update(decrypted.as_bytes());
-                        let expected_hash = hasher.finalize();
-                        let mut hasher = Hasher::new();
-                        hasher.update(decrypted.as_bytes());
-                        let actual_hash = hasher.finalize();
-                        if expected_hash == actual_hash {
-                            let suggest = ux.llm_suggest(&input).await.unwrap_or_default();
-                            history.push(format!("{} [sugg: {}]", input, suggest));
-                            let orchestrated = orchestrate(agents.clone(), &decrypted).await.expect("Orchestration failed");
-                            execute_command(&orchestrated, &vulkan_instance).await;
-                            input.clear();
-                            terminal.backend_mut().print(Clear(ClearType::CurrentLine))?;
-                        } else {
-                            input.clear();
+                        // 1. Encrypt with integrated integrity hash
+                        let encrypted_packet = encrypt_command_with_integrity(&input).await;
+
+                        // 2. Decrypt and verify in a single, atomic operation
+                        match decrypt_command_with_integrity(&encrypted_packet).await {
+                            Ok(decrypted) => {
+                                // Integrity confirmed: proceed with execution
+                                let suggest = ux.llm_suggest(&input).await.unwrap_or_default();
+                                history.push(format!("{} [sugg: {}]", input, suggest));
+                                let orchestrated = orchestrate(agents.clone(), &decrypted).await.expect("Orchestration failed");
+                                execute_command(&orchestrated, &vulkan_instance).await;
+                            },
+                            Err(e) => {
+                                // Integrity check failed: do not execute
+                                // This would be logged to the TUI in a real implementation
+                                eprintln!("CRITICAL: {}. Command rejected.", e);
+                            }
                         }
+                        input.clear();
                     }
                 },
                 KeyCode::Char(c) => input.push(c),

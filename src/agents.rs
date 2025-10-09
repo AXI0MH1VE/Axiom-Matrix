@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use candle_core::{Device, Tensor};
-use candle_transformers::models::bert::BertModel;
+use candle_core::{Device, Tensor, DType};
+use candle_transformers::models::bert::{BertModel, Config};
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
+use candle_hub::api::Api;
+use std::fs;
 use vulkano::instance::Instance as VulkanInstance;
+use super::ethics::EthicalGuard;
 
 #[async_trait]
 pub trait Agent: Send + Sync {
@@ -22,25 +25,22 @@ pub struct EthicalAgent {
 impl EthicalAgent {
     pub fn new(guard: Arc<EthicalGuard>) -> Self {
         let device = Device::Cpu;
-        let vb = VarBuilder::zeros(device.clone());
-        let model = BertModel::load(&vb, "bert-base-uncased").expect("Model load");
-        // Embedded vocab for EthicalAgent
-        let vocab_str = r#"{
-  "pad_token": "[PAD]",
-  "unk_token": "[UNK]",
-  "bos_token": "[CLS]",
-  "eos_token": "[SEP]",
-  "unk_id": 100,
-  "sep_token": "[SEP]",
-  "cls_token": "[CLS]",
-  "pad_token_id": 0,
-  "sep_token_id": 102,
-  "cls_token_id": 101,
-  "mask_token": "[MASK]",
-  "mask_token_id": 103
-}"#;
-        let tokenizer = Tokenizer::from_str(vocab_str).expect("Embedded vocab load");
-        Self { guard, llm_model: Arc::new(model), tokenizer: Arc::new(tokenizer), device }
+        let api = Api::new().unwrap();
+        let repo = api.repo("distilbert-base-uncased".to_string());
+        let config_filename = repo.get("config.json").unwrap();
+        let tokenizer_filename = repo.get("tokenizer.json").unwrap();
+        let weights_filename = repo.get("model.safetensors").unwrap();
+        let config = fs::read_to_string(config_filename).unwrap();
+        let config: Config = serde_json::from_str(&config).unwrap();
+        let tokenizer = Tokenizer::from_file(tokenizer_filename).unwrap();
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], DType::F32, &device).unwrap() };
+        let model = BertModel::load(vb, &config).unwrap();
+        Self {
+            guard,
+            llm_model: Arc::new(model),
+            tokenizer: Arc::new(tokenizer),
+            device,
+        }
     }
 }
 
