@@ -5,3 +5,4 @@ pub mod ethics;
 pub mod gpu;
 pub mod orchestration;
 pub mod ux;
+pub mod ui;
